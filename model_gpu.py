@@ -2,13 +2,13 @@ import os
 import random
 
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import Dense, Dropout, Activation, Flatten, Conv2D, MaxPooling2D
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras import optimizers
 from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.datasets import mnist
-from scipy.ndimage import gaussian_filter, map_coordinates
 
 from image_utils import (
     random_rotation, random_shear, random_shift,
@@ -16,6 +16,25 @@ from image_utils import (
 )
 from accuracy import print_accuracy_report
 from timing import EpochTimer, RunEstimator, timed_stage
+
+# --- GPU setup ---------------------------------------------------------------
+# Allocate GPU memory on demand instead of reserving the whole card up front, so the
+# script can share the GPU with other processes (it makes no difference to speed).
+for _gpu in tf.config.list_physical_devices('GPU'):
+    try:
+        tf.config.experimental.set_memory_growth(_gpu, True)
+    except RuntimeError:
+        pass  # already initialised
+
+# Number of batches Keras runs inside a single tf.function call. The model is tiny, so
+# at batch size 128 training is bound by per-step Python/launch overhead rather than by
+# GPU compute; batching steps together removes most of it. Batch size, optimizer, data
+# order and all per-step maths are unchanged, so training dynamics are identical.
+STEPS_PER_EXECUTION = 200
+
+# Compile the train/test step with XLA: fuses the small conv/dense/activation kernels
+# into a few large ones. Same float32 arithmetic, no precision reduction.
+USE_XLA = True
 
 # Smoke-test mode: set to False to run the full experiment as originally intended.
 SMOKE_TEST = False
@@ -53,10 +72,10 @@ def augment_data(dataset, dataset_labels, augmentation_factor=1, use_random_rota
 
 
 def crop(img, size):
-    """Crop a fixed-size window from an image, starting at (4, 4)."""
+    """Crop a fixed-size window starting at (4, 4) from an image (H, W, C) or a batch (N, H, W, C)."""
     x_0 = 4
     y_0 = 4
-    return img[x_0:x_0 + size, y_0:y_0 + size]
+    return img[..., x_0:x_0 + size, y_0:y_0 + size, :]
 
 
 def rotation_2(x, theta, row_axis=1, col_axis=2, channel_axis=0, fill_mode='nearest', cval=0.):
@@ -86,33 +105,145 @@ def rotations(dataset, dataset_labels, angles):
     return np.array(augmented_image), np.array(augmented_image_labels)
 
 
+# --- GPU elastic deformation -------------------------------------------------
+# Drop-in replacement for the SciPy version: the random displacement fields are
+# built, Gaussian-smoothed and bilinearly sampled on the GPU, in batches.
+# Numerically equivalent to gaussian_filter(mode='constant') + map_coordinates(order=1).
+
+ELASTIC_CHUNK = 8192  # images processed per GPU batch (each yields 4 deformations)
+
+
+def _gaussian_kernel1d(sigma, truncate=4.0):
+    """1-D Gaussian kernel identical to the one scipy.ndimage builds."""
+    radius = int(truncate * sigma + 0.5)
+    x = np.arange(-radius, radius + 1, dtype=np.float64)
+    k = np.exp(-0.5 * (x / sigma) ** 2)
+    k /= k.sum()
+    return k.astype(np.float32)
+
+
+def _gaussian_blur(field, kernel):
+    """Separable Gaussian blur on (B, H, W, 1). 'SAME' zero-padding == mode='constant', cval=0."""
+    ky = tf.reshape(kernel, [-1, 1, 1, 1])
+    kx = tf.reshape(kernel, [1, -1, 1, 1])
+    field = tf.nn.conv2d(field, ky, strides=1, padding='SAME')
+    field = tf.nn.conv2d(field, kx, strides=1, padding='SAME')
+    return field
+
+
+def _bilinear_sample(images, row, col):
+    """Bilinear sampling matching map_coordinates(order=1, mode='constant', cval=0).
+
+    Coordinates outside [0, n-1] yield 0, exactly as scipy's legacy 'constant' mode does.
+    images: (B, H, W); row/col: (B, H, W) float32.
+    """
+    shape = tf.shape(images)
+    b, h, w = shape[0], shape[1], shape[2]
+    fh = tf.cast(h - 1, tf.float32)
+    fw = tf.cast(w - 1, tf.float32)
+
+    inside = ((row >= 0.0) & (row <= fh) & (col >= 0.0) & (col <= fw))
+
+    r = tf.clip_by_value(row, 0.0, fh)
+    c = tf.clip_by_value(col, 0.0, fw)
+    r0 = tf.floor(r)
+    c0 = tf.floor(c)
+    wr = r - r0
+    wc = c - c0
+
+    r0i = tf.cast(r0, tf.int32)
+    c0i = tf.cast(c0, tf.int32)
+    r1i = tf.minimum(r0i + 1, h - 1)
+    c1i = tf.minimum(c0i + 1, w - 1)
+
+    flat = tf.reshape(images, [b, h * w])
+
+    def gather(ri, ci):
+        return tf.gather(flat, tf.reshape(ri * w + ci, [b, -1]), batch_dims=1)
+
+    v00 = gather(r0i, c0i)
+    v01 = gather(r0i, c1i)
+    v10 = gather(r1i, c0i)
+    v11 = gather(r1i, c1i)
+
+    wr = tf.reshape(wr, [b, -1])
+    wc = tf.reshape(wc, [b, -1])
+    top = v00 * (1.0 - wc) + v01 * wc
+    bottom = v10 * (1.0 - wc) + v11 * wc
+    out = top * (1.0 - wr) + bottom * wr
+
+    out = tf.reshape(out, [b, h, w])
+    return tf.where(inside, out, tf.zeros_like(out))
+
+
+def _elastic_from_fields(images, raw_dx, raw_dy, alpha, kernel):
+    """Deform `images` (B, H, W) with the given raw uniform fields in [-1, 1].
+
+    Split out from the random generation so the transform can be tested against SciPy
+    on identical fields.
+    """
+    shape = tf.shape(images)
+    h, w = shape[1], shape[2]
+
+    dx = _gaussian_blur(raw_dx[..., None], kernel)[..., 0] * alpha
+    dy = _gaussian_blur(raw_dy[..., None], kernel)[..., 0] * alpha
+
+    rows = tf.cast(tf.range(h), tf.float32)[None, :, None]
+    cols = tf.cast(tf.range(w), tf.float32)[None, None, :]
+
+    return _bilinear_sample(images, rows + dy, cols + dx)
+
+
+@tf.function(reduce_retracing=True)
+def _elastic_batch(images, alpha, kernel, n_variants):
+    """Return (B, n_variants + 1, H, W): n_variants deformations then the original."""
+    shape = tf.shape(images)
+    b, h, w = shape[0], shape[1], shape[2]
+
+    repeated = tf.reshape(tf.tile(images[:, None], [1, n_variants, 1, 1]), [-1, h, w])
+    raw_dx = tf.random.uniform(tf.shape(repeated), dtype=tf.float32) * 2.0 - 1.0
+    raw_dy = tf.random.uniform(tf.shape(repeated), dtype=tf.float32) * 2.0 - 1.0
+
+    deformed = _elastic_from_fields(repeated, raw_dx, raw_dy, alpha, kernel)
+    deformed = tf.reshape(deformed, [b, n_variants, h, w])
+    return tf.concat([deformed, images[:, None]], axis=1)
+
+
 def elastic_transform(image, alpha, sigma, random_state=None):
-    """Apply an elastic deformation to an image (chsasank/elastic_transform.py)."""
+    """Single-image elastic deformation, kept for compatibility (runs on the GPU)."""
+    image = np.asarray(image, dtype=np.float32)
+    kernel = tf.constant(_gaussian_kernel1d(sigma))
     if random_state is None:
         random_state = np.random.RandomState(None)
-
-    shape = image.shape
-    dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-    dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-
-    x, y = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]))
-    indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
-
-    return map_coordinates(image, indices, order=1).reshape(shape)
+    raw_dx = (random_state.rand(*image.shape) * 2 - 1).astype(np.float32)
+    raw_dy = (random_state.rand(*image.shape) * 2 - 1).astype(np.float32)
+    out = _elastic_from_fields(image[None], raw_dx[None], raw_dy[None],
+                               np.float32(alpha), kernel)
+    return out.numpy()[0]
 
 
 def getElastics(images, labels, alpha, sigma):
-    """Apply elastic deformation to every image in the dataset (4 variants each)."""
-    augmented = []
-    augmented_labels = []
-    for i in range(len(images)):
-        news = np.array([elastic_transform(images[i][0], alpha, sigma) for j in range(4)])
-        news = np.append(news, images[i][0])
-        augmented.append(news)
-        augmented_labels.append([labels[i], labels[i], labels[i], labels[i], labels[i]])
+    """Apply elastic deformation to every image in the dataset (4 variants each).
 
-    return (np.reshape(augmented, newshape=(5 * len(images), images.shape[2], images.shape[3])),
-            np.reshape(augmented_labels, 5 * len(images)))
+    Same contract as the SciPy version: input (N, 1, H, W), output (5N, H, W) laid out
+    as [4 deformations, original] per source image, plus each label repeated 5 times.
+    """
+    n_variants = 4
+    images = np.asarray(images, dtype=np.float32)
+    flat = images[:, 0]
+    n, h, w = flat.shape
+
+    kernel = tf.constant(_gaussian_kernel1d(sigma))
+    alpha = np.float32(alpha)
+
+    out = np.empty((n * (n_variants + 1), h, w), dtype=np.float32)
+    for start in range(0, n, ELASTIC_CHUNK):
+        chunk = flat[start:start + ELASTIC_CHUNK]
+        result = _elastic_batch(tf.constant(chunk), alpha, kernel, n_variants)
+        out[start * (n_variants + 1):(start + len(chunk)) * (n_variants + 1)] = \
+            result.numpy().reshape(-1, h, w)
+
+    return out, np.repeat(labels, n_variants + 1)
 
 
 def augmentate(images, labels, alpha, sigma):
@@ -157,7 +288,8 @@ def experiment(X_train, Y_train, X_test, Y_test, y_test, file, epochs=50, model_
     # decay_steps=1 reproduces the old schedule exactly: lr0 / (1 + decay * step).
     lr = optimizers.schedules.InverseTimeDecay(0.01, decay_steps=1, decay_rate=1e-6)
     sgd = optimizers.SGD(learning_rate=lr, momentum=0.95, nesterov=True)
-    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
+    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'],
+                  steps_per_execution=STEPS_PER_EXECUTION, jit_compile=USE_XLA)
 
     os.makedirs(os.path.dirname(file) or '.', exist_ok=True)
     checkpoint = ModelCheckpoint(file, monitor='val_accuracy', mode='max',
@@ -198,7 +330,8 @@ def experiment_2(X_train, Y_train, X_test_org, Y_test, y_test, file, epochs=50):
     # decay_steps=1 reproduces the old schedule exactly: lr0 / (1 + decay * step).
     lr = optimizers.schedules.InverseTimeDecay(0.01, decay_steps=1, decay_rate=1e-6)
     sgd = optimizers.SGD(learning_rate=lr, momentum=0.95, nesterov=True)
-    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
+    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'],
+                  steps_per_execution=STEPS_PER_EXECUTION, jit_compile=USE_XLA)
 
     print("Training...")
     model.fit(X_train, Y_train, batch_size=128, epochs=epochs, verbose=0)
@@ -229,11 +362,12 @@ def main():
     X_train /= 255
     X_test /= 255
 
-    X_train = np.array([crop(X_train[i], 20) for i in range(len(X_train))])
-    X_test = np.array([crop(X_test[i], 20) for i in range(len(X_test))])
+    # Vectorised crop + per-image mean subtraction (same result as the per-image loop).
+    X_train = np.ascontiguousarray(crop(X_train, 20))
+    X_test = np.ascontiguousarray(crop(X_test, 20))
 
-    X_train = np.array([X_train[i] - np.mean(X_train[i]) for i in range(len(X_train))])
-    X_test = np.array([X_test[i] - np.mean(X_test[i]) for i in range(len(X_test))])
+    X_train -= X_train.mean(axis=(1, 2, 3), keepdims=True)
+    X_test -= X_test.mean(axis=(1, 2, 3), keepdims=True)
 
     with timed_stage("random augmentation"):
         X_train_random, y_train_random = augment_data(

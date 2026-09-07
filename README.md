@@ -24,6 +24,7 @@ This repo contains the two Keras/TensorFlow training scripts for FS1's CNN compo
 - [DropConnect.py](DropConnect.py) — a deeper CNN (VGG-style, two 3x3 conv-conv-pool blocks) trained on 24x24 crops.
 - [image_utils.py](image_utils.py) — random rotation/shear/shift helpers, reimplemented with scipy since these were removed from modern Keras.
 - [accuracy.py](accuracy.py) — shared accuracy reporting used during training, and a standalone CLI to re-evaluate any saved model.
+- [ensemble.py](ensemble.py) — fuses the predictions of several saved models and reports the ensemble accuracy.
 
 Both training scripts share the same pipeline: crop the digit, subtract the per-image mean, apply random rotation/shear/shift augmentation, then apply elastic deformation, before training a CNN with SGD.
 
@@ -61,6 +62,15 @@ SMOKE_TEST = False
 ```bash
 python accuracy.py models_random_elastic_2/modelo1.h5
 python accuracy.py models_random_elastic_2/*.h5
+```
+
+### Ensembling
+
+`ensemble.py` loads several saved models (each preprocessed to its own crop size), fuses their softmax outputs, and reports the ensemble accuracy next to each individual model. Fusion methods: `mean` (default), `geo` (geometric mean), `vote` (majority vote) and `certainty` (most confident model wins). Because the training scripts validate on the MNIST test set, `--select` splits the test set in two, picks the method by val_accuracy on one half and reports it on the other half.
+
+```bash
+python ensemble.py models_random_elastic_2/modelo1.h5 models_other_random_elastic_2/modelo1.h5
+python ensemble.py models_random_elastic_2/*.h5 models_other_random_elastic_2/*.h5 --all-methods --select
 ```
 
 ## Notes

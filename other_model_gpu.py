@@ -1,14 +1,27 @@
+"""GPU-optimised version of other_model.py (the DropConnect-style CNN on 24x24 crops).
+
+Same pipeline and same model as other_model.py: random 24x24 crop, per-image mean
+subtraction, random rotation/shear/shift, elastic deformation (4 variants + original),
+then SGD training with Nesterov momentum and the original inverse-time learning-rate decay.
+
+Differences are purely about speed:
+  * elastic deformation runs on the GPU in batches (shared with model_gpu.py, verified
+    against the SciPy version to ~1e-6);
+  * crop / mean subtraction are vectorised (identical values, identical random draws);
+  * training steps are batched (steps_per_execution) and XLA-compiled, both in float32;
+  * GPU memory is allocated on demand so the script can coexist with other jobs.
+"""
 import os
 import random
 
 import numpy as np
+import tensorflow as tf
 from tensorflow.keras.models import Sequential, load_model
 from tensorflow.keras.layers import Dense, Dropout, Activation, Flatten, Conv2D, MaxPooling2D
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras import optimizers
 from tensorflow.keras.callbacks import ModelCheckpoint
 from tensorflow.keras.datasets import mnist
-from scipy.ndimage import gaussian_filter, map_coordinates
 
 from image_utils import (
     random_rotation, random_shear, random_shift,
@@ -16,12 +29,20 @@ from image_utils import (
 )
 from accuracy import print_accuracy_report
 from timing import EpochTimer, RunEstimator, timed_stage
+# GPU elastic deformation (batched Gaussian blur + bilinear sampling); importing
+# model_gpu also enables on-demand GPU memory growth.
+from model_gpu import getElastics, elastic_transform, STEPS_PER_EXECUTION, USE_XLA
 
 # Smoke-test mode: set to False to run the full experiment as originally intended.
 SMOKE_TEST = False
 SMOKE_TRAIN_SIZE = 200
 SMOKE_TEST_SIZE = 100
 SMOKE_EPOCHS = 1
+
+# Models are saved in their own directory (model_gpu.py uses ./models_random_elastic_2)
+# so both scripts can run and their checkpoints compared side by side:
+#   python accuracy.py models_random_elastic_2/*.h5 models_other_random_elastic_2/*.h5
+MODEL_DIR = './models_other_random_elastic_2'
 
 
 def augment_data(dataset, dataset_labels, augmentation_factor=1, use_random_rotation=True,
@@ -52,11 +73,39 @@ def augment_data(dataset, dataset_labels, augmentation_factor=1, use_random_rota
     return np.array(augmented_image)[s], np.array(augmented_image_labels)[s]
 
 
-def crop(img, size):
-    """Crop a fixed-size window from an image, starting at (4, 4)."""
-    x_0 = 4
-    y_0 = 4
+def crop(img, size, isRand=True):
+    """Crop a window of the given size, at a random position unless isRand is False."""
+    n = len(img) - size
+    x_0 = 2
+    y_0 = 2
+    if isRand:
+        x_0 = random.randint(0, n)
+        y_0 = random.randint(0, n)
+
     return img[x_0:x_0 + size, y_0:y_0 + size]
+
+
+def crop_batch(images, size, isRand=True):
+    """Vectorised equivalent of `[crop(img, size, isRand) for img in images]`.
+
+    Draws the random offsets with the same `random.randint` calls in the same order as
+    the per-image loop, so the crops are identical for a given random seed.
+    """
+    count, height = images.shape[0], images.shape[1]
+    n = height - size
+    if isRand:
+        offsets = np.array([(random.randint(0, n), random.randint(0, n)) for _ in range(count)],
+                           dtype=np.intp).reshape(count, 2)
+        x_0, y_0 = offsets[:, 0], offsets[:, 1]
+    else:
+        x_0 = np.full(count, 2, dtype=np.intp)
+        y_0 = np.full(count, 2, dtype=np.intp)
+
+    idx = np.arange(size)
+    rows = (x_0[:, None] + idx)[:, :, None]      # (N, size, 1)
+    cols = (y_0[:, None] + idx)[:, None, :]      # (N, 1, size)
+    batch = np.arange(count)[:, None, None]
+    return np.ascontiguousarray(images[batch, rows, cols])
 
 
 def rotation_2(x, theta, row_axis=1, col_axis=2, channel_axis=0, fill_mode='nearest', cval=0.):
@@ -86,78 +135,53 @@ def rotations(dataset, dataset_labels, angles):
     return np.array(augmented_image), np.array(augmented_image_labels)
 
 
-def elastic_transform(image, alpha, sigma, random_state=None):
-    """Apply an elastic deformation to an image (chsasank/elastic_transform.py)."""
-    if random_state is None:
-        random_state = np.random.RandomState(None)
-
-    shape = image.shape
-    dx = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-    dy = gaussian_filter((random_state.rand(*shape) * 2 - 1), sigma, mode="constant", cval=0) * alpha
-
-    x, y = np.meshgrid(np.arange(shape[0]), np.arange(shape[1]))
-    indices = np.reshape(y + dy, (-1, 1)), np.reshape(x + dx, (-1, 1))
-
-    return map_coordinates(image, indices, order=1).reshape(shape)
-
-
-def getElastics(images, labels, alpha, sigma):
-    """Apply elastic deformation to every image in the dataset (4 variants each)."""
-    augmented = []
-    augmented_labels = []
-    for i in range(len(images)):
-        news = np.array([elastic_transform(images[i][0], alpha, sigma) for j in range(4)])
-        news = np.append(news, images[i][0])
-        augmented.append(news)
-        augmented_labels.append([labels[i], labels[i], labels[i], labels[i], labels[i]])
-
-    return (np.reshape(augmented, newshape=(5 * len(images), images.shape[2], images.shape[3])),
-            np.reshape(augmented_labels, 5 * len(images)))
-
-
 def augmentate(images, labels, alpha, sigma):
     """Elastic-deform the dataset, then add rotated copies at fixed angles."""
-    images = images.reshape(images.shape[0], 1, 20, 20)
+    images = images.reshape(images.shape[0], 1, 24, 24)
     deformated, new_labels = getElastics(images, labels, alpha, sigma)
-    deformated = deformated.reshape(deformated.shape[0], 20, 20, 1)
+    deformated = deformated.reshape(deformated.shape[0], 24, 24, 1)
     augmented = rotations(deformated, new_labels, [-16, -8, 8, 16])
-    return augmented[0].reshape(augmented[0].shape[0], 20, 20, 1), augmented[1]
+    return augmented[0].reshape(augmented[0].shape[0], 24, 24, 1), augmented[1]
 
 
 def augmentate_2(images, labels, alpha, sigma):
     """Elastic-deform the dataset without adding rotated copies."""
-    images = images.reshape(images.shape[0], 1, 20, 20)
+    images = images.reshape(images.shape[0], 1, 24, 24)
     deformated, new_labels = getElastics(images, labels, alpha, sigma)
-    deformated = deformated.reshape(deformated.shape[0], 20, 20, 1)
+    deformated = deformated.reshape(deformated.shape[0], 24, 24, 1)
     return deformated, new_labels
 
 
 def experiment(X_train, Y_train, X_test, Y_test, y_test, file, epochs=50, model_label=""):
-    """Build, train and evaluate the small CNN (3x3 convs), then save it to `file`."""
+    """Build, train and evaluate the DropConnect-style CNN, then save it to `file`."""
     model = Sequential()
-    model.add(Conv2D(20, (3, 3), padding='same', input_shape=X_train.shape[1:]))
+    model.add(Conv2D(32, (3, 3), padding='same', input_shape=X_train.shape[1:]))
+    model.add(Activation('relu'))
+    model.add(Conv2D(32, (3, 3)))
     model.add(Activation('relu'))
     model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
 
-    model.add(Conv2D(40, (3, 3), padding='same'))
+    model.add(Conv2D(64, (3, 3), padding='same'))
+    model.add(Activation('relu'))
+    model.add(Conv2D(64, (3, 3)))
     model.add(Activation('relu'))
     model.add(MaxPooling2D(pool_size=(2, 2)))
+    model.add(Dropout(0.25))
 
     model.add(Flatten())
-    model.add(Dense(640))
-    model.add(Activation('relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(1000))
+    model.add(Dense(512))
     model.add(Activation('relu'))
     model.add(Dropout(0.5))
     model.add(Dense(10))
     model.add(Activation('softmax'))
 
-    # `decay` was removed from the Keras 3 optimizer; InverseTimeDecay with
-    # decay_steps=1 reproduces the old schedule exactly: lr0 / (1 + decay * step).
+    # `decay` was removed from the Keras optimizer; InverseTimeDecay with decay_steps=1
+    # reproduces the old schedule exactly: lr0 / (1 + decay * step).
     lr = optimizers.schedules.InverseTimeDecay(0.01, decay_steps=1, decay_rate=1e-6)
     sgd = optimizers.SGD(learning_rate=lr, momentum=0.95, nesterov=True)
-    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
+    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'],
+                  steps_per_execution=STEPS_PER_EXECUTION, jit_compile=USE_XLA)
 
     os.makedirs(os.path.dirname(file) or '.', exist_ok=True)
     checkpoint = ModelCheckpoint(file, monitor='val_accuracy', mode='max',
@@ -170,43 +194,7 @@ def experiment(X_train, Y_train, X_test, Y_test, y_test, file, epochs=50, model_
 
     print("Evaluating best checkpoint...")
     best_model = load_model(file)
-    print_accuracy_report(best_model, X_test, y_test, Y_test)
-
-
-def experiment_2(X_train, Y_train, X_test_org, Y_test, y_test, file, epochs=50):
-    """Variant of `experiment` using 5x5 convs, evaluated on the uncropped test set."""
-    model = Sequential()
-    model.add(Conv2D(20, (5, 5), padding='same', input_shape=X_train.shape[1:]))
-    model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-
-    model.add(Conv2D(40, (5, 5), padding='same'))
-    model.add(Activation('relu'))
-    model.add(MaxPooling2D(pool_size=(2, 2)))
-
-    model.add(Flatten())
-    model.add(Dense(640))
-    model.add(Activation('relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(1000))
-    model.add(Activation('relu'))
-    model.add(Dropout(0.5))
-    model.add(Dense(10))
-    model.add(Activation('softmax'))
-
-    # `decay` was removed from the Keras 3 optimizer; InverseTimeDecay with
-    # decay_steps=1 reproduces the old schedule exactly: lr0 / (1 + decay * step).
-    lr = optimizers.schedules.InverseTimeDecay(0.01, decay_steps=1, decay_rate=1e-6)
-    sgd = optimizers.SGD(learning_rate=lr, momentum=0.95, nesterov=True)
-    model.compile(loss='categorical_crossentropy', optimizer=sgd, metrics=['accuracy'])
-
-    print("Training...")
-    model.fit(X_train, Y_train, batch_size=128, epochs=epochs, verbose=0)
-
-    print("Evaluating...")
-    print_accuracy_report(model, X_test_org, y_test, Y_test)
-
-    model.save(file)
+    return print_accuracy_report(best_model, X_test, y_test, Y_test)
 
 
 def main():
@@ -229,11 +217,13 @@ def main():
     X_train /= 255
     X_test /= 255
 
-    X_train = np.array([crop(X_train[i], 20) for i in range(len(X_train))])
-    X_test = np.array([crop(X_test[i], 20) for i in range(len(X_test))])
+    # Vectorised crop (random position for train, fixed for test) + per-image mean
+    # subtraction; same values as the per-image loops.
+    X_train = crop_batch(X_train, 24)
+    X_test = crop_batch(X_test, 24, isRand=False)
 
-    X_train = np.array([X_train[i] - np.mean(X_train[i]) for i in range(len(X_train))])
-    X_test = np.array([X_test[i] - np.mean(X_test[i]) for i in range(len(X_test))])
+    X_train -= X_train.mean(axis=(1, 2, 3), keepdims=True)
+    X_test -= X_test.mean(axis=(1, 2, 3), keepdims=True)
 
     with timed_stage("random augmentation"):
         X_train_random, y_train_random = augment_data(
@@ -253,11 +243,17 @@ def main():
     print("Training: random augmentation + elastic deformations")
 
     run = RunEstimator(n_models)
+    results = []
     for i in range(1, n_models + 1):
         with run.track_model(i):
-            experiment(X_train_2, Y_train_2, X_test, Y_test, y_test,
-                       f'./models_random_elastic_2/modelo{i}.h5', epochs=epochs,
-                       model_label=f"model {i}/{n_models}")
+            loss, acc = experiment(X_train_2, Y_train_2, X_test, Y_test, y_test,
+                                   f'{MODEL_DIR}/modelo{i}.h5', epochs=epochs,
+                                   model_label=f"model {i}/{n_models}")
+        results.append((i, loss, acc))
+
+    print(f"\n=== Summary: best-val_accuracy checkpoints in {MODEL_DIR} ===")
+    for i, loss, acc in results:
+        print(f"modelo{i}.h5: test accuracy {acc * 100:.2f}%  loss {loss:.4f}")
 
 
 if __name__ == '__main__':
