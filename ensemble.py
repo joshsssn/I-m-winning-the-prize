@@ -18,7 +18,7 @@ their validation data, so there is no separate held-out set. --select splits
 the test set into two halves, picks the best method on one half (the
 val_accuracy) and reports it on the other half, then swaps the halves.
 
-    python ensemble.py models_random_elastic_2/modelo1.h5 models_other_random_elastic_2/modelo1.h5
+    python ensemble.py models_random_elastic_2/20x20.h5 models_other_random_elastic_2/24x24.h5
     python ensemble.py models_random_elastic_2/*.h5 models_other_random_elastic_2/*.h5 --method geo
     python ensemble.py ... --save-probs probs.npz
 """

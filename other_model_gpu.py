@@ -247,13 +247,13 @@ def main():
     for i in range(1, n_models + 1):
         with run.track_model(i):
             loss, acc = experiment(X_train_2, Y_train_2, X_test, Y_test, y_test,
-                                   f'{MODEL_DIR}/modelo{i}.h5', epochs=epochs,
+                                   f'{MODEL_DIR}/24x24_{i}.h5', epochs=epochs,
                                    model_label=f"model {i}/{n_models}")
         results.append((i, loss, acc))
 
     print(f"\n=== Summary: best-val_accuracy checkpoints in {MODEL_DIR} ===")
     for i, loss, acc in results:
-        print(f"modelo{i}.h5: test accuracy {acc * 100:.2f}%  loss {loss:.4f}")
+        print(f"24x24_{i}.h5: test accuracy {acc * 100:.2f}%  loss {loss:.4f}")
 
 
 if __name__ == '__main__':

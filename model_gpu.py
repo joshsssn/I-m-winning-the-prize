@@ -390,7 +390,7 @@ def main():
     for i in range(1, n_models + 1):
         with run.track_model(i):
             experiment(X_train_2, Y_train_2, X_test, Y_test, y_test,
-                       f'./models_random_elastic_2/modelo{i}.h5', epochs=epochs,
+                       f'./models_random_elastic_2/20x20_{i}.h5', epochs=epochs,
                        model_label=f"model {i}/{n_models}")
 
 

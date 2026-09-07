@@ -42,7 +42,7 @@ pip install -r requirements.txt
 
 ### Training
 
-Each script trains 5 models (by default) and saves them to `./models_random_elastic_2/modeloN.h5`.
+Each script trains 5 models (by default) and saves them to `./models_random_elastic_2/20x20_N.h5` (Network3-style, 20x20 crops) or `./models_other_random_elastic_2/24x24_N.h5` (DropConnect-style, 24x24 crops). The two shipped checkpoints are `models_random_elastic_2/20x20.h5` and `models_other_random_elastic_2/24x24.h5`.
 
 ```bash
 python Network3.py
@@ -60,7 +60,7 @@ SMOKE_TEST = False
 `accuracy.py` loads a saved model, detects the input size it was trained on (20x20 or 24x24), applies the matching preprocessing to the MNIST test set, and reports loss, accuracy, and misclassified sample indices.
 
 ```bash
-python accuracy.py models_random_elastic_2/modelo1.h5
+python accuracy.py models_random_elastic_2/20x20.h5
 python accuracy.py models_random_elastic_2/*.h5
 ```
 
@@ -69,7 +69,7 @@ python accuracy.py models_random_elastic_2/*.h5
 `ensemble.py` loads several saved models (each preprocessed to its own crop size), fuses their softmax outputs, and reports the ensemble accuracy next to each individual model. Fusion methods: `mean` (default), `geo` (geometric mean), `vote` (majority vote) and `certainty` (most confident model wins). Because the training scripts validate on the MNIST test set, `--select` splits the test set in two, picks the method by val_accuracy on one half and reports it on the other half.
 
 ```bash
-python ensemble.py models_random_elastic_2/modelo1.h5 models_other_random_elastic_2/modelo1.h5
+python ensemble.py models_random_elastic_2/20x20.h5 models_other_random_elastic_2/24x24.h5
 python ensemble.py models_random_elastic_2/*.h5 models_other_random_elastic_2/*.h5 --all-methods --select
 ```
 

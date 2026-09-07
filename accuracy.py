@@ -8,7 +8,7 @@ match before evaluating it.
 Run directly to evaluate one or more saved .h5/.keras models against the
 MNIST test set:
 
-    python accuracy.py models_random_elastic_2/modelo1.h5
+    python accuracy.py models_random_elastic_2/20x20.h5
     python accuracy.py models_random_elastic_2/*.h5
 """
 import argparse
